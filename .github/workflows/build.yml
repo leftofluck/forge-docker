@@ -1,5 +1,9 @@
 name: build-forge-on-release
 
+permissions:
+  contents: read
+  packages: write
+
 on:
   schedule:
     - cron: "0 */6 * * *"   # 6時間ごと
