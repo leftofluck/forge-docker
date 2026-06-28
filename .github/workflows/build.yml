@@ -1,26 +1,31 @@
 name: build-forge-on-release
 
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
 permissions:
   contents: read
   packages: write
-
-on:
-  schedule:
-    - cron: "0 */6 * * *"   # 6時間ごと
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get latest release tag
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 最新タグ取得
+      - name: Get latest release
         id: release
         run: |
           tag=$(curl -s https://api.github.com/repos/antoinezambelli/forge/releases/latest | jq -r .tag_name)
           echo "tag=$tag" >> $GITHUB_OUTPUT
 
-      - name: Check if already built
+      # すでにビルド済みかチェック
+      - name: Check built cache
         id: cache
         uses: actions/cache@v4
         with:
@@ -31,23 +36,47 @@ jobs:
         if: steps.cache.outputs.cache-hit == 'true'
         run: exit 0
 
-      - name: Clone forge (release tag)
+      # ソース取得
+      - name: Clone source
         run: |
           git clone --depth 1 --branch ${{ steps.release.outputs.tag }} https://github.com/antoinezambelli/forge.git src
 
-      - name: Build Docker image
-        run: |
-          docker build -t ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} ./src
-          docker tag ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} ghcr.io/${{ github.repository_owner }}/forge:latest
+      # buildx 有効化（マルチアーキの前提）
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GHCR ログイン
       - name: Login to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Push Docker image
+      # マルチアーキ build & push
+      - name: Build and Push (multi-arch)
+        id: build
         run: |
-          docker push ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }}
-          docker push ghcr.io/${{ github.repository_owner }}/forge:latest
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} \
+            -t ghcr.io/${{ github.repository_owner }}/forge:latest \
+            --push ./src
 
-      - name: Save built tag
+      # digest取得（再現性用）
+      - name: Get digest
+        id: digest
+        run: |
+          digest=$(docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} \
+            | grep Digest | head -n1 | awk '{print $2}')
+          echo "digest=$digest" >> $GITHUB_OUTPUT
+
+      # digestをログ出力
+      - name: Show pull command
+        run: |
+          echo "==== USE THIS FOR REPRODUCIBLE ===="
+          echo "docker pull ghcr.io/${{ github.repository_owner }}/forge@${{ steps.digest.outputs.digest }}"
+
+      # ビルド済みタグ保存
+      - name: Save tag
         run: echo "${{ steps.release.outputs.tag }}" > tag.txt
