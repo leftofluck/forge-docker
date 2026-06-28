@@ -1,0 +1,49 @@
+name: build-forge-on-release
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 6時間ごと
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get latest release tag
+        id: release
+        run: |
+          tag=$(curl -s https://api.github.com/repos/antoinezambelli/forge/releases/latest | jq -r .tag_name)
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+
+      - name: Check if already built
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: tag.txt
+          key: forge-${{ steps.release.outputs.tag }}
+
+      - name: Skip if already built
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: exit 0
+
+      - name: Clone forge (release tag)
+        run: |
+          git clone --depth 1 --branch ${{ steps.release.outputs.tag }} https://github.com/antoinezambelli/forge.git src
+
+      - name: Build Docker image
+        run: |
+          docker build -t ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} ./src
+          docker tag ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} ghcr.io/${{ github.repository_owner }}/forge:latest
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push Docker image
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }}
+          docker push ghcr.io/${{ github.repository_owner }}/forge:latest
+
+      - name: Save built tag
+        run: echo "${{ steps.release.outputs.tag }}" > tag.txt
