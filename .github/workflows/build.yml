@@ -1,9 +1,10 @@
-name: build-forge-on-release
+name: Build Forge Image
 
 on:
   workflow_dispatch:
 
   schedule:
+    # 6時間ごとに Desired State を確認する
     - cron: "0 */6 * * *"
 
 permissions:
@@ -13,7 +14,7 @@ permissions:
 env:
   UPSTREAM_OWNER: antoinezambelli
   UPSTREAM_REPO: forge
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/forge
+  IMAGE_NAME: forge
 
 jobs:
 
@@ -30,7 +31,9 @@ jobs:
       # ============================================================
       # Step 1
       #
-      # Latest Release のタグ名を取得する。
+      # upstream の Latest Release を取得する。
+      #
+      # まず release tag を取得する。
       # ============================================================
       - name: Get latest release
         id: release
@@ -43,21 +46,21 @@ jobs:
               --jq '.tag_name'
           )
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       # ============================================================
       # Step 2
       #
-      # Release が指している Commit SHA を取得する。
+      # Release Tag が指している Commit SHA を取得する。
       #
-      # この Commit SHA を Desired State とする。
+      # Desired State の正体は tag ではなく commit。
       # ============================================================
       - name: Resolve release revision
         id: upstream
         run: |
-          git init repo
+          git init forge
 
-          cd repo
+          cd forge
 
           git remote add origin \
             https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git
@@ -72,30 +75,79 @@ jobs:
           REVISION=$(git rev-parse HEAD)
 
           echo "tag=${{ steps.release.outputs.tag }}" >> "$GITHUB_OUTPUT"
-          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
 
       # ============================================================
       # Step 3
       #
-      # GHCR上の manifest annotation を取得する。
+      # GHCR の OCI Index を取得する。
       #
       # pull は行わない。
-      # image layer も取得しない。
       #
-      # annotation に格納した
-      # upstream revision
-      # を読む。
+      # OCI Index →
+      # amd64 manifest →
+      # config digest
+      #
+      # を取得する。
       # ============================================================
-      - name: Read current annotation
-        id: current
+      - name: Resolve current image config digest
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
         run: |
 
+          TOKEN=$(curl -fsSL \
+            "https://ghcr.io/token?scope=repository:${OWNER}/${IMAGE_NAME}:pull" \
+            | jq -r '.token')
+
+          INDEX_JSON=$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${OWNER}/${IMAGE_NAME}/manifests/latest"
+          ) || true
+
+          if [ -z "${INDEX_JSON}" ]; then
+            echo "revision=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AMD64_DIGEST=$(
+            echo "${INDEX_JSON}" |
+            jq -r '
+              .manifests[]
+              | select(.platform.architecture=="amd64")
+              | .digest
+            ' | head -n1
+          )
+
+          MANIFEST_JSON=$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${OWNER}/${IMAGE_NAME}/manifests/${AMD64_DIGEST}"
+          )
+
+          CONFIG_DIGEST=$(
+            echo "${MANIFEST_JSON}" |
+            jq -r '.config.digest'
+          )
+
+          echo "config_digest=${CONFIG_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          CONFIG_JSON=$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${OWNER}/${IMAGE_NAME}/blobs/${CONFIG_DIGEST}"
+          )
+
           CURRENT_REVISION=$(
-            docker buildx imagetools inspect \
-              ${IMAGE_NAME}:latest \
-              --format '{{ index .Manifest "Annotations" "org.opencontainers.image.revision" }}' \
-              2>/dev/null \
-              || true
+            echo "${CONFIG_JSON}" |
+            jq -r '
+              .config.Labels["org.opencontainers.image.revision"]
+              // empty
+            '
           )
 
           echo "revision=${CURRENT_REVISION}" >> "$GITHUB_OUTPUT"
@@ -107,23 +159,33 @@ jobs:
       #
       # source commit SHA
       # と
-      # image annotation
-      # を比較する。
+      # image label revision
+      #
+      # のみを比較する。
       # ============================================================
       - name: Compare desired state
         id: compare
         run: |
 
-          CURRENT="${{ steps.current.outputs.revision }}"
+          CURRENT="${{ steps.image.outputs.revision }}"
           DESIRED="${{ steps.upstream.outputs.revision }}"
 
-          echo "Current : $CURRENT"
-          echo "Desired : $DESIRED"
+          echo "Current revision : ${CURRENT}"
+          echo "Desired revision : ${DESIRED}"
 
-          if [ -n "$CURRENT" ] && [ "$CURRENT" = "$DESIRED" ]; then
+          if [ -n "${CURRENT}" ] &&
+             [ "${CURRENT}" = "${DESIRED}" ]; then
+
+            echo "Desired state achieved"
+
             echo "should_build=false" >> "$GITHUB_OUTPUT"
+
           else
+
+            echo "Drift detected"
+
             echo "should_build=true" >> "$GITHUB_OUTPUT"
+
           fi
 
   build:
@@ -139,7 +201,8 @@ jobs:
       # Step 5
       #
       # Release Tag のソースを取得する。
-      # Dockerfile は upstream のものを利用する。
+      #
+      # upstream Dockerfile をそのまま利用する。
       # ============================================================
       - name: Checkout source
         uses: actions/checkout@v4
@@ -150,16 +213,21 @@ jobs:
       # ============================================================
       # Step 6
       #
-      # Multi Arch Build 準備。
+      # ARM64 build 用。
       # ============================================================
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
 
+      # ============================================================
+      # Step 7
+      #
+      # Multi Arch Builder。
+      # ============================================================
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
       # ============================================================
-      # Step 7
+      # Step 8
       #
       # GHCR Login。
       # ============================================================
@@ -171,38 +239,34 @@ jobs:
           password: ${{ github.token }}
 
       # ============================================================
-      # Step 8
+      # Step 9
       #
       # OCI Metadata。
       #
-      # revision を annotation と label の両方へ格納する。
-      #
-      # 次回判定は annotation を利用する。
+      # revision は次回比較のために埋め込む。
       # ============================================================
-      - name: Metadata
+      - name: Generate metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository_owner }}/forge
 
           tags: |
             type=raw,value=latest
             type=raw,value=${{ needs.determine.outputs.tag }}
 
           labels: |
+            org.opencontainers.image.source=https://github.com/antoinezambelli/forge
             org.opencontainers.image.version=${{ needs.determine.outputs.tag }}
             org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
-            org.opencontainers.image.source=https://github.com/antoinezambelli/forge
 
       # ============================================================
-      # Step 9
+      # Step 10
       #
       # Multi Arch Build。
       #
-      # BuildKit Cache を利用する。
-      #
-      # cache は高速化用。
-      # 判定には使用しない。
+      # cache はビルド高速化専用。
+      # 判定には利用しない。
       # ============================================================
       - name: Build and push
         id: build
@@ -220,20 +284,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-          annotations: |
-            org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
-
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
       # ============================================================
-      # Step 10
+      # Step 11
       #
-      # Manifest List Digest を出力する。
+      # Manifest Digest を出力する。
       #
       # digest は成果物識別用。
-      # 判定には利用しない。
+      # 判定には使わない。
       # ============================================================
-      - name: Output digest
+      - name: Show digest
         run: |
           echo "Digest: ${{ steps.build.outputs.digest }}"
