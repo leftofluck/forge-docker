@@ -1,82 +1,239 @@
 name: build-forge-on-release
 
 on:
+  workflow_dispatch:
+
   schedule:
     - cron: "0 */6 * * *"
-  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
+env:
+  UPSTREAM_OWNER: antoinezambelli
+  UPSTREAM_REPO: forge
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/forge
+
 jobs:
+
+  determine:
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      revision: ${{ steps.upstream.outputs.revision }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+
+    steps:
+
+      # ============================================================
+      # Step 1
+      #
+      # Latest Release のタグ名を取得する。
+      # ============================================================
+      - name: Get latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(
+            gh api \
+              repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest \
+              --jq '.tag_name'
+          )
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Step 2
+      #
+      # Release が指している Commit SHA を取得する。
+      #
+      # この Commit SHA を Desired State とする。
+      # ============================================================
+      - name: Resolve release revision
+        id: upstream
+        run: |
+          git init repo
+
+          cd repo
+
+          git remote add origin \
+            https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git
+
+          git fetch \
+            --depth=1 \
+            origin \
+            refs/tags/${{ steps.release.outputs.tag }}
+
+          git checkout FETCH_HEAD
+
+          REVISION=$(git rev-parse HEAD)
+
+          echo "tag=${{ steps.release.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Step 3
+      #
+      # GHCR上の manifest annotation を取得する。
+      #
+      # pull は行わない。
+      # image layer も取得しない。
+      #
+      # annotation に格納した
+      # upstream revision
+      # を読む。
+      # ============================================================
+      - name: Read current annotation
+        id: current
+        run: |
+
+          CURRENT_REVISION=$(
+            docker buildx imagetools inspect \
+              ${IMAGE_NAME}:latest \
+              --format '{{ index .Manifest "Annotations" "org.opencontainers.image.revision" }}' \
+              2>/dev/null \
+              || true
+          )
+
+          echo "revision=${CURRENT_REVISION}" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Step 4
+      #
+      # Desired State 判定。
+      #
+      # source commit SHA
+      # と
+      # image annotation
+      # を比較する。
+      # ============================================================
+      - name: Compare desired state
+        id: compare
+        run: |
+
+          CURRENT="${{ steps.current.outputs.revision }}"
+          DESIRED="${{ steps.upstream.outputs.revision }}"
+
+          echo "Current : $CURRENT"
+          echo "Desired : $DESIRED"
+
+          if [ -n "$CURRENT" ] && [ "$CURRENT" = "$DESIRED" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: determine
+
+    if: needs.determine.outputs.should_build == 'true'
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # 最新タグ取得
-      - name: Get latest release
-        id: release
-        run: |
-          tag=$(curl -s https://api.github.com/repos/antoinezambelli/forge/releases/latest | jq -r .tag_name)
-          echo "tag=$tag" >> $GITHUB_OUTPUT
-
-      # すでにビルド済みかチェック
-      - name: Check built cache
-        id: cache
-        uses: actions/cache@v4
+      # ============================================================
+      # Step 5
+      #
+      # Release Tag のソースを取得する。
+      # Dockerfile は upstream のものを利用する。
+      # ============================================================
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
-          path: tag.txt
-          key: forge-${{ steps.release.outputs.tag }}
+          repository: antoinezambelli/forge
+          ref: ${{ needs.determine.outputs.tag }}
 
-      - name: Skip if already built
-        if: steps.cache.outputs.cache-hit == 'true'
-        run: exit 0
-
-      # ソース取得
-      - name: Clone source
-        run: |
-          git clone --depth 1 --branch ${{ steps.release.outputs.tag }} https://github.com/antoinezambelli/forge.git src
-
-      # buildx 有効化（マルチアーキの前提）
-      - name: Set up QEMU
+      # ============================================================
+      # Step 6
+      #
+      # Multi Arch Build 準備。
+      # ============================================================
+      - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Buildx
+      - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # GHCR ログイン
-      - name: Login to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      # ============================================================
+      # Step 7
+      #
+      # GHCR Login。
+      # ============================================================
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
-      # マルチアーキ build & push
-      - name: Build and Push (multi-arch)
+      # ============================================================
+      # Step 8
+      #
+      # OCI Metadata。
+      #
+      # revision を annotation と label の両方へ格納する。
+      #
+      # 次回判定は annotation を利用する。
+      # ============================================================
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.determine.outputs.tag }}
+
+          labels: |
+            org.opencontainers.image.version=${{ needs.determine.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/antoinezambelli/forge
+
+      # ============================================================
+      # Step 9
+      #
+      # Multi Arch Build。
+      #
+      # BuildKit Cache を利用する。
+      #
+      # cache は高速化用。
+      # 判定には使用しない。
+      # ============================================================
+      - name: Build and push
         id: build
-        run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            -t ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} \
-            -t ghcr.io/${{ github.repository_owner }}/forge:latest \
-            --push ./src
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
 
-      # digest取得（再現性用）
-      - name: Get digest
-        id: digest
-        run: |
-          digest=$(docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/forge:${{ steps.release.outputs.tag }} \
-            | grep Digest | head -n1 | awk '{print $2}')
-          echo "digest=$digest" >> $GITHUB_OUTPUT
+          push: true
 
-      # digestをログ出力
-      - name: Show pull command
-        run: |
-          echo "==== USE THIS FOR REPRODUCIBLE ===="
-          echo "docker pull ghcr.io/${{ github.repository_owner }}/forge@${{ steps.digest.outputs.digest }}"
+          platforms: |
+            linux/amd64
+            linux/arm64
 
-      # ビルド済みタグ保存
-      - name: Save tag
-        run: echo "${{ steps.release.outputs.tag }}" > tag.txt
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+          annotations: |
+            org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
+
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # ============================================================
+      # Step 10
+      #
+      # Manifest List Digest を出力する。
+      #
+      # digest は成果物識別用。
+      # 判定には利用しない。
+      # ============================================================
+      - name: Output digest
+        run: |
+          echo "Digest: ${{ steps.build.outputs.digest }}"
