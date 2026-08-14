@@ -207,7 +207,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: antoinezambelli/forge
+          repository: ${UPSTREAM_OWNER}/${UPSTREAM_REPO}
           ref: ${{ needs.determine.outputs.tag }}
 
       # ============================================================
@@ -249,14 +249,14 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/forge
+          images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
 
           tags: |
             type=raw,value=latest
             type=raw,value=${{ needs.determine.outputs.tag }}
 
           labels: |
-            org.opencontainers.image.source=https://github.com/antoinezambelli/forge
+            org.opencontainers.image.source=https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}
             org.opencontainers.image.version=${{ needs.determine.outputs.tag }}
             org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
 
