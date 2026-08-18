@@ -207,7 +207,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: ${UPSTREAM_OWNER}/${UPSTREAM_REPO}
+          repository: ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.determine.outputs.tag }}
 
       # ============================================================
@@ -256,7 +256,7 @@ jobs:
             type=raw,value=${{ needs.determine.outputs.tag }}
 
           labels: |
-            org.opencontainers.image.source=https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}
             org.opencontainers.image.version=${{ needs.determine.outputs.tag }}
             org.opencontainers.image.revision=${{ needs.determine.outputs.revision }}
 
